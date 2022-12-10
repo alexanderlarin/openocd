@@ -46,6 +46,18 @@
 #include <transport/transport.h>
 #include "bitbang.h"
 
+
+#define WIRINGPI
+
+#ifdef MY_DIRFS
+#include "orangepi2gpio-mapping.h"
+#endif
+
+#ifdef WIRINGPI
+#include <wiringPi.h>
+#endif
+
+
 /*
  * Helper func to determine if gpio number valid
  *
@@ -80,14 +92,16 @@ static int open_write_close(const char *name, const char *valstr)
  */
 static void unexport_sysfs_gpio(int gpio)
 {
-	char gpiostr[5];
+#ifdef ORIG_DIRFS
+    char gpiostr[5];
 
-	if (!is_gpio_valid(gpio))
-		return;
+    if (!is_gpio_valid(gpio))
+        return;
 
-	snprintf(gpiostr, sizeof(gpiostr), "%d", gpio);
-	if (open_write_close("/sys/class/gpio/unexport", gpiostr) < 0)
-		LOG_ERROR("Couldn't unexport gpio %d", gpio);
+    snprintf(gpiostr, sizeof(gpiostr), "%d", gpio);
+    if (open_write_close("/sys/class/gpio/unexport", gpiostr) < 0)
+        LOG_ERROR("Couldn't unexport gpio %d", gpio);
+#endif
 }
 
 /*
@@ -101,7 +115,6 @@ static void unexport_sysfs_gpio(int gpio)
  */
 static int setup_sysfs_gpio(int gpio, int is_output, int init_high)
 {
-	struct timeval timeout, now;
 	char buf[40];
 	char gpiostr[5];
 	int ret;
@@ -109,6 +122,7 @@ static int setup_sysfs_gpio(int gpio, int is_output, int init_high)
 	if (!is_gpio_valid(gpio))
 		return ERROR_OK;
 
+#ifdef ORIG_DIRFS
 	snprintf(gpiostr, sizeof(gpiostr), "%d", gpio);
 	ret = open_write_close("/sys/class/gpio/export", gpiostr);
 	if (ret < 0) {
@@ -120,11 +134,26 @@ static int setup_sysfs_gpio(int gpio, int is_output, int init_high)
 			return ERROR_FAIL;
 		}
 	}
+#endif
 
-	gettimeofday(&timeout, NULL);
+#if defined(MY_DIRFS) || defined(ORIG_DIRFS)
+    struct timeval timeout, now;
+    gettimeofday(&timeout, NULL);
 	timeval_add_time(&timeout, 0, 500000);
-
-	snprintf(buf, sizeof(buf), "/sys/class/gpio/gpio%d/direction", gpio);
+#ifdef MY_DIRFS
+    snprintf(buf, sizeof(buf), "/sys/class/gpio_sw/%s/cfg", gpio_map[gpio].name);
+    for (;;) {
+		ret = open_write_close(buf, is_output ? (init_high ? "0" : "1") : "1");
+		if (ret >= 0 || errno != EACCES)
+			break;
+		gettimeofday(&now, NULL);
+		if (timeval_compare(&now, &timeout) >= 0)
+			break;
+		jtag_sleep(10000);
+	}
+#endif
+#ifdef ORIG_DIRFS
+    snprintf(buf, sizeof(buf), "/sys/class/gpio/gpio%d/direction", gpio);
 	for (;;) {
 		ret = open_write_close(buf, is_output ? (init_high ? "high" : "low") : "in");
 		if (ret >= 0 || errno != EACCES)
@@ -134,15 +163,22 @@ static int setup_sysfs_gpio(int gpio, int is_output, int init_high)
 			break;
 		jtag_sleep(10000);
 	}
-	if (ret < 0) {
+#endif
+
+    if (ret < 0) {
 		LOG_ERROR("Couldn't set direction for gpio %d", gpio);
 		LOG_ERROR("sysfsgpio: %s", strerror(errno));
 		unexport_sysfs_gpio(gpio);
 		return ERROR_FAIL;
-	}
+    }
 
-	snprintf(buf, sizeof(buf), "/sys/class/gpio/gpio%d/value", gpio);
-	for (;;) {
+#ifdef MY_DIRFS
+    snprintf(buf, sizeof(buf), "/sys/class/gpio_sw/%s/data", gpio_map[gpio].name);
+#endif
+#ifdef ORIG_DIRFS
+    snprintf(buf, sizeof(buf), "/sys/class/gpio/gpio%d/value", gpio);
+#endif
+    for (;;) {
 		ret = open(buf, O_RDWR | O_NONBLOCK | O_SYNC);
 		if (ret >= 0 || errno != EACCES)
 			break;
@@ -151,13 +187,21 @@ static int setup_sysfs_gpio(int gpio, int is_output, int init_high)
 			break;
 		jtag_sleep(10000);
 	}
-	if (ret < 0) {
+
+    if (ret < 0) {
 		LOG_ERROR("Couldn't open value for gpio %d", gpio);
 		LOG_ERROR("sysfsgpio: %s", strerror(errno));
 		unexport_sysfs_gpio(gpio);
-	}
+    }
+#endif
 
-	return ret;
+#ifdef WIRINGPI
+    // pinMode(gpio, is_output ? (init_high ? HIGH : LOW) : INPUT);
+    pinMode(gpio, is_output ? OUTPUT : INPUT);
+    ret = 0;
+#endif
+
+    return ret;
 }
 
 /* gpio numbers for each gpio. Negative values are invalid */
@@ -193,8 +237,20 @@ static void sysfsgpio_swdio_drive(bool is_output)
 	char buf[40];
 	int ret;
 
-	snprintf(buf, sizeof(buf), "/sys/class/gpio/gpio%d/direction", swdio_gpio);
-	ret = open_write_close(buf, is_output ? "high" : "in");
+#ifdef MY_DIRFS
+    snprintf(buf, sizeof(buf), "/sys/class/gpio_sw/%s/cfg", gpio_map[swdio_gpio].name);
+    ret = open_write_close(buf, is_output ? "0" : "1");
+#endif
+
+#ifdef ORIG_DIRFS
+    snprintf(buf, sizeof(buf), "/sys/class/gpio/gpio%d/direction", swdio_gpio);
+    ret = open_write_close(buf, is_output ? "high" : "in");
+#endif
+
+#ifdef WIRINGPI
+    pinMode(swdio_gpio, is_output ? HIGH : INPUT);
+#endif
+
 	if (ret < 0) {
 		LOG_ERROR("Couldn't set direction for gpio %d", swdio_gpio);
 		LOG_ERROR("sysfsgpio: %s", strerror(errno));
@@ -206,23 +262,30 @@ static void sysfsgpio_swdio_drive(bool is_output)
 
 static int sysfsgpio_swdio_read(void)
 {
-	char buf[1];
+#if defined(MY_DIRFS) || defined(ORIG_DIRFS)
+    char buf[1];
 
-	/* important to seek to signal sysfs of new read */
-	lseek(swdio_fd, 0, SEEK_SET);
-	int ret = read(swdio_fd, &buf, sizeof(buf));
+    /* important to seek to signal sysfs of new read */
+    lseek(swdio_fd, 0, SEEK_SET);
+    int ret = read(swdio_fd, &buf, sizeof(buf));
 
-	if (ret < 0) {
-		LOG_WARNING("reading swdio failed");
-		return 0;
-	}
+    if (ret < 0) {
+        LOG_WARNING("reading swdio failed");
+        return 0;
+    }
 
-	return buf[0] != '0';
+    return buf[0] != '0';
+#endif
+
+#ifdef WIRINGPI
+    return digitalRead(swdio_gpio);
+#endif
 }
 
 static int sysfsgpio_swd_write(int swclk, int swdio)
 {
-	const char one[] = "1";
+#if defined(MY_DIRFS) || defined(ORIG_DIRFS)
+    const char one[] = "1";
 	const char zero[] = "0";
 
 	size_t bytes_written;
@@ -241,6 +304,20 @@ static int sysfsgpio_swd_write(int swclk, int swdio)
 		if (bytes_written != 1)
 			LOG_WARNING("writing swclk failed");
 	}
+#endif
+
+#ifdef WIRINGPI
+    if (!swdio_input) {
+        if (!last_stored || (swdio != last_swdio)) {
+            digitalWrite(swdio_gpio, swdio);
+        }
+    }
+
+    /* write swclk last */
+    if (!last_stored || (swclk != last_swclk)) {
+        digitalWrite(swclk_gpio, swclk);
+    }
+#endif
 
 	last_swdio = swdio;
 	last_swclk = swclk;
@@ -257,18 +334,24 @@ static int sysfsgpio_swd_write(int swclk, int swdio)
  */
 static bb_value_t sysfsgpio_read(void)
 {
-	char buf[1];
+#if defined(MY_DIRFS) || defined(ORIG_DIRFS)
+    char buf[1];
 
-	/* important to seek to signal sysfs of new read */
-	lseek(tdo_fd, 0, SEEK_SET);
-	int ret = read(tdo_fd, &buf, sizeof(buf));
+    /* important to seek to signal sysfs of new read */
+    lseek(tdo_fd, 0, SEEK_SET);
+    int ret = read(tdo_fd, &buf, sizeof(buf));
 
-	if (ret < 0) {
-		LOG_WARNING("reading tdo failed");
-		return 0;
-	}
+    if (ret < 0) {
+        LOG_WARNING("reading tdo failed");
+        return 0;
+    }
 
-	return buf[0] == '0' ? BB_LOW : BB_HIGH;
+    return buf[0] == '0' ? BB_LOW : BB_HIGH;
+#endif
+
+#ifdef WIRINGPI
+    return digitalRead(tdo_gpio);
+#endif
 }
 
 /*
@@ -279,7 +362,8 @@ static bb_value_t sysfsgpio_read(void)
  */
 static int sysfsgpio_write(int tck, int tms, int tdi)
 {
-	const char one[] = "1";
+#if defined(MY_DIRFS) || defined(ORIG_DIRFS)
+    const char one[] = "1";
 	const char zero[] = "0";
 
 	static int last_tck;
@@ -314,6 +398,36 @@ static int sysfsgpio_write(int tck, int tms, int tdi)
 		if (bytes_written != 1)
 			LOG_WARNING("writing tck failed");
 	}
+#endif
+
+#ifdef WIRINGPI
+    static int last_tck;
+    static int last_tms;
+    static int last_tdi;
+
+    static int first_time;
+    size_t bytes_written;
+
+    if (!first_time) {
+        last_tck = !tck;
+        last_tms = !tms;
+        last_tdi = !tdi;
+        first_time = 1;
+    }
+
+    if (tdi != last_tdi) {
+        digitalWrite(tdi_gpio, tdi);
+    }
+
+    if (tms != last_tms) {
+        digitalWrite(tms_gpio, tms);
+    }
+
+    /* write clk last */
+    if (tck != last_tck) {
+        digitalWrite(tck_gpio, tck);
+    }
+#endif
 
 	last_tdi = tdi;
 	last_tms = tms;
@@ -329,8 +443,10 @@ static int sysfsgpio_write(int tck, int tms, int tdi)
  */
 static int sysfsgpio_reset(int trst, int srst)
 {
-	LOG_DEBUG("sysfsgpio_reset");
-	const char one[] = "1";
+    LOG_DEBUG("sysfsgpio_reset");
+
+#if defined(MY_DIRFS) || defined(ORIG_DIRFS)
+    const char one[] = "1";
 	const char zero[] = "0";
 	size_t bytes_written;
 
@@ -347,8 +463,21 @@ static int sysfsgpio_reset(int trst, int srst)
 		if (bytes_written != 1)
 			LOG_WARNING("writing trst failed");
 	}
+#endif
 
-	return ERROR_OK;
+#ifdef WIRINGPI
+    /* assume active low */
+    if (srst_fd >= 0) {
+        digitalWrite(srst_gpio, ~srst);
+    }
+
+    /* assume active low */
+    if (trst_fd >= 0) {
+        digitalWrite(trst_gpio, ~trst);
+    }
+#endif
+
+    return ERROR_OK;
 }
 
 COMMAND_HANDLER(sysfsgpio_handle_jtag_gpionums)
@@ -577,16 +706,17 @@ static struct bitbang_interface sysfsgpio_bitbang = {
 /* helper func to close and cleanup files only if they were valid/ used */
 static void cleanup_fd(int fd, int gpio)
 {
-	if (gpio >= 0) {
-		if (fd >= 0)
-			close(fd);
+    if (gpio >= 0) {
+        if (fd >= 0)
+            close(fd);
 
-		unexport_sysfs_gpio(gpio);
-	}
+        unexport_sysfs_gpio(gpio);
+    }
 }
 
 static void cleanup_all_fds(void)
 {
+#if defined(MY_DIRFS) || defined(ORIG_DIRFS)
 	if (transport_is_jtag()) {
 		cleanup_fd(tck_fd, tck_gpio);
 		cleanup_fd(tms_fd, tms_gpio);
@@ -599,6 +729,7 @@ static void cleanup_all_fds(void)
 		cleanup_fd(swdio_fd, swdio_gpio);
 	}
 	cleanup_fd(srst_fd, srst_gpio);
+#endif
 }
 
 static bool sysfsgpio_jtag_mode_possible(void)
@@ -626,6 +757,14 @@ static bool sysfsgpio_swd_mode_possible(void)
 static int sysfsgpio_init(void)
 {
 	bitbang_interface = &sysfsgpio_bitbang;
+
+#ifdef WIRINGPI
+    if (wiringPiSetup() < 0)
+    {
+        LOG_ERROR("Unable to setup wiringPi");
+        return ERROR_JTAG_INIT_FAILED;
+    }
+#endif
 
 	LOG_INFO("SysfsGPIO JTAG/SWD bitbang driver");
 
